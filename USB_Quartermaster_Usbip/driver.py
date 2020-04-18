@@ -1,14 +1,11 @@
-import asyncio
 import logging
 import platform
 import shutil
+import subprocess
 from typing import Dict, NamedTuple, Set, Optional, Iterable, List
 
-import paramiko
-from django.conf import settings
-
 from USB_Quartermaster_common import AbstractRemoteHostDriver, AbstractShareableDeviceDriver, AbstractLocalDriver, \
-    CommandResponse
+    CommandResponse, CommunicatorError
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +17,12 @@ class DeviceDetails(NamedTuple):
     vendor: str
     product: str
 
+
 class DriverMetaData(object):
     SUPPORTED_COMMUNICATORS = ('SSH',)
     SUPPORTED_HOST_TYPES = ('Linux_AMD64',)
     IDENTIFIER = "USBIP"
+
 
 class UsbipOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
     NO_REMOTE_DEVICES = 'usbip: info: no exportable devices found on '
@@ -31,17 +30,15 @@ class UsbipOverSSHHost(AbstractRemoteHostDriver, DriverMetaData):
     MISSING_KERNEL_MODULE = 'error: unable to bind device on '
     USBIP_DRIVER_PATH = '/sys/bus/usb/plugins/usbip-host'
 
-
-
     def __init__(self, host: 'RemoteHost'):
         super().__init__(host=host)
 
     def execute_command(self, command: str):
         try:
             response = self.communicator.execute_command(command=command)
-        except paramiko.SSHException as e:
+        except CommunicatorError as e:
             raise self.HostConnectionError(
-                f"Ran into problems connecting to {settings.SSH_USERNAME}@{self.host.address}: {e}")
+                f"Ran into problems connecting to {self.host}: {e}")
         if response.return_code != 0:
             if self.USBIPD_NOT_RUNNING in response.stderr:
                 message = f"usbipd is not running on {self.host}"
@@ -175,18 +172,13 @@ class UsbipLocal(AbstractLocalDriver, DriverMetaData):
         if self.usbip is None:
             raise self.CommandNotFound(f"usbip was not found in PATH. {self.setup_information()}")
 
-    async def run_usbip(self, arguments: List[str]):
+    def run_usbip(self, arguments: List[str]):
         command = ['sudo', self.usbip, *arguments]
         command_str = " ".join(command)
         logger.debug(command_str)
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-
-        stdout_bytes, stderr_bytes = await proc.communicate()
-        stdout = stdout_bytes.decode('ascii')
-        stderr = stderr_bytes.decode('ascii')
+        proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout = proc.stdout.decode('ascii')
+        stderr = proc.stderr.decode('ascii')
 
         if proc.returncode != 0:
             response = CommandResponse(return_code=proc.returncode, stdout=stdout, stderr=stderr)
@@ -197,20 +189,20 @@ class UsbipLocal(AbstractLocalDriver, DriverMetaData):
 
         return stdout
 
-    async def connected(self) -> bool:
-        port = await self.get_port()
+    def connected(self) -> bool:
+        port = self.get_port()
         return port is not None
 
-    async def connect(self) -> None:
+    def connect(self) -> None:
         args = ['attach', '-r', self.conf['host_address'], '-b', self.conf['bus_id']]
         try:
-            await self.run_usbip(args)
+            self.run_usbip(args)
         except self.CommandError as e:
             print(f"Error attaching {self.conf['host_address']} {self.conf['bus_id']}, "
                   f"rc={e.rc}, stdout={e.stdout}, stderr={e.stderr}")
             raise e
 
-    async def get_port(self) -> Optional[int]:
+    def get_port(self) -> Optional[int]:
         """# usbip port
                 Imported USB devices
                 ====================
@@ -219,7 +211,7 @@ class UsbipLocal(AbstractLocalDriver, DriverMetaData):
                        2-1 -> usbip://10.3.40.43:3240/1-11
                            -> remote bus/dev 001/008"""
         args = ['port']
-        output = await self.run_usbip(args)
+        output = self.run_usbip(args)
         header = True
         ports = output.split('\nPort ')[1:]  # Skip the first group which is just the header
         logger.debug(ports)
@@ -231,12 +223,12 @@ class UsbipLocal(AbstractLocalDriver, DriverMetaData):
         else:
             return None
 
-    async def disconnect(self) -> None:
+    def disconnect(self) -> None:
 
-        port = await self.get_port()
+        port = self.get_port()
         if port:
             args = ['detach', '-p', port]
-            await self.run_usbip(args)
+            self.run_usbip(args)
         else:
             print(f"Could not find port for bus_id '{self.conf['bus_id']}', maybe device is already "
                   f"disconnected")
